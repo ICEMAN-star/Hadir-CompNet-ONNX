@@ -12,18 +12,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ==========================================
+      # 1. Download repository
+      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ==========================================
+      # 2. Install Python
+      # ==========================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: pip
-          cache-dependency-path: requirements-onnx.txt
 
+      # ==========================================
+      # 3. Install required libraries
+      # ==========================================
       - name: Install dependencies
+        shell: bash
         run: |
+          set -e
+
           python -m pip install --upgrade pip
 
           pip install numpy==1.26.4
@@ -34,12 +44,17 @@ jobs:
           pip install onnx==1.17.0
           pip install onnxruntime==1.20.1
 
+      # ==========================================
+      # 4. Locate CompNet source and weights
+      # ==========================================
       - name: Locate and verify CompNet files
         shell: bash
         run: |
           set -e
 
           mkdir -p source output
+
+          echo "Searching for CompNet source..."
 
           MODEL_FILE=$(find . -type f \
             -iname "compnet.py" \
@@ -62,8 +77,7 @@ jobs:
               exit 1
             fi
 
-            echo "Extracting: $ZIP_FILE"
-
+            echo "Extracting source archive..."
             unzip -o "$ZIP_FILE" -d source
 
           fi
@@ -94,6 +108,9 @@ jobs:
           echo "CHECKPOINT: $WEIGHT_FILE"
           echo "================================"
 
+      # ==========================================
+      # 5. Export CompNet feature extractor to ONNX
+      # ==========================================
       - name: Build and export ONNX
         shell: bash
         run: |
@@ -115,13 +132,19 @@ jobs:
               "output/compnet_tongji_600_feature.onnx"
           )
 
+          os.makedirs("output", exist_ok=True)
+
           print("================================")
-          print("COMPNet ONNX EXPORT")
+          print("COMPNET ONNX EXPORT")
           print("================================")
 
           print("PyTorch version:", torch.__version__)
           print("NumPy version:", np.__version__)
           print("ONNX version:", onnx.__version__)
+
+          # --------------------------------------
+          # Load CompNet source
+          # --------------------------------------
 
           print("\nLoading CompNet source...")
 
@@ -133,11 +156,19 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
 
-          print("Creating CompNet model...")
+          # --------------------------------------
+          # Create model
+          # --------------------------------------
+
+          print("\nCreating CompNet model...")
 
           model = module.compnet(num_classes=600)
 
-          print("Loading pretrained checkpoint...")
+          # --------------------------------------
+          # Load pretrained weights
+          # --------------------------------------
+
+          print("\nLoading pretrained checkpoint...")
 
           checkpoint = torch.load(
               WEIGHT_FILE,
@@ -154,13 +185,26 @@ jobs:
 
           print("All pretrained weights loaded successfully.")
 
+          # --------------------------------------
+          # Verify model architecture
+          # --------------------------------------
+
           print("\nChecking model parameters...")
 
-          assert model.fc.weight.shape == (512, 9708)
-          assert model.arclayer.weight.shape == (600, 512)
+          assert model.fc.weight.shape == (512, 9708), (
+              "Unexpected FC weight dimensions"
+          )
+
+          assert model.arclayer.weight.shape == (600, 512), (
+              "Unexpected ArcFace weight dimensions"
+          )
 
           print("FC:", tuple(model.fc.weight.shape))
           print("ArcFace:", tuple(model.arclayer.weight.shape))
+
+          # --------------------------------------
+          # Feature extraction wrapper
+          # --------------------------------------
 
           class FeatureExtractor(nn.Module):
 
@@ -174,14 +218,28 @@ jobs:
           feature_model = FeatureExtractor(model)
           feature_model.eval()
 
+          # --------------------------------------
+          # Prepare input
+          # --------------------------------------
+
           print("\nPreparing input...")
 
           dummy_input = torch.randn(
-              1, 1, 128, 128,
+              1,
+              1,
+              128,
+              128,
               dtype=torch.float32
           )
 
-          print("Input shape:", tuple(dummy_input.shape))
+          print(
+              "Input shape:",
+              tuple(dummy_input.shape)
+          )
+
+          # --------------------------------------
+          # Test PyTorch model
+          # --------------------------------------
 
           print("\nTesting PyTorch...")
 
@@ -193,9 +251,13 @@ jobs:
               tuple(pytorch_output.shape)
           )
 
-          assert pytorch_output.shape == (1, 512)
+          assert pytorch_output.shape == (1, 512), (
+              "Unexpected PyTorch feature dimensions"
+          )
 
-          assert torch.isfinite(pytorch_output).all()
+          assert torch.isfinite(pytorch_output).all(), (
+              "PyTorch output contains invalid values"
+          )
 
           pytorch_norm = torch.linalg.vector_norm(
               pytorch_output,
@@ -204,6 +266,10 @@ jobs:
           )
 
           print("PyTorch feature norm:", pytorch_norm)
+
+          # --------------------------------------
+          # Export ONNX
+          # --------------------------------------
 
           print("\nExporting ONNX...")
 
@@ -229,15 +295,21 @@ jobs:
 
           print("ONNX export completed.")
 
+          # --------------------------------------
+          # Verify ONNX structure
+          # --------------------------------------
+
           print("\nChecking ONNX model...")
 
           onnx_model = onnx.load(OUTPUT_FILE)
 
-          onnx.checker.check_model(
-              onnx_model
-          )
+          onnx.checker.check_model(onnx_model)
 
           print("ONNX structure is valid.")
+
+          # --------------------------------------
+          # Test ONNX Runtime
+          # --------------------------------------
 
           print("\nTesting ONNX Runtime...")
 
@@ -258,9 +330,17 @@ jobs:
               onnx_output.shape
           )
 
-          assert onnx_output.shape == (1, 512)
+          assert onnx_output.shape == (1, 512), (
+              "Unexpected ONNX feature dimensions"
+          )
 
-          assert np.isfinite(onnx_output).all()
+          assert np.isfinite(onnx_output).all(), (
+              "ONNX output contains invalid values"
+          )
+
+          # --------------------------------------
+          # Compare PyTorch and ONNX outputs
+          # --------------------------------------
 
           print("\nComparing PyTorch and ONNX...")
 
@@ -279,6 +359,10 @@ jobs:
               "PyTorch and ONNX outputs differ too much"
           )
 
+          # --------------------------------------
+          # Verify feature normalization
+          # --------------------------------------
+
           norms = np.linalg.norm(
               onnx_output,
               axis=1
@@ -290,16 +374,20 @@ jobs:
               norms,
               1.0,
               atol=1e-4
-          )
+          ), "Feature vector is not normalized"
 
-          print("\n================================")
-          print("SUCCESS: ONNX VERIFIED")
-          print("================================")
+          # --------------------------------------
+          # Final report
+          # --------------------------------------
 
           file_size = (
               os.path.getsize(OUTPUT_FILE)
               / (1024 * 1024)
           )
+
+          print("\n================================")
+          print("SUCCESS: ONNX VERIFIED")
+          print("================================")
 
           print(
               "ONNX file size:",
@@ -308,26 +396,35 @@ jobs:
           )
 
           print(
-              "Output dimensions:",
-              onnx_output.shape
-          )
-
-          print(
               "Input dimensions: 1 x 1 x 128 x 128"
           )
 
-          print("Output dimensions: 1 x 512")
+          print(
+              "Output dimensions: 1 x 512"
+          )
+
+          print(
+              "Maximum difference:",
+              difference
+          )
+
+          print("\nONNX export and verification completed.")
 
           PY
 
           python export_compnet.py
 
+      # ==========================================
+      # 6. Verify exported ONNX file
+      # ==========================================
       - name: Verify ONNX output file
         shell: bash
         run: |
           set -e
 
           FILE="output/compnet_tongji_600_feature.onnx"
+
+          echo "Checking ONNX output..."
 
           if [ ! -f "$FILE" ]; then
             echo "ERROR: ONNX file was not created"
@@ -340,8 +437,14 @@ jobs:
           fi
 
           echo "ONNX file successfully created."
+
           ls -lh "$FILE"
 
+          echo "ONNX file verification passed."
+
+      # ==========================================
+      # 7. Upload ONNX as GitHub Artifact
+      # ==========================================
       - name: Upload ONNX Artifact
         uses: actions/upload-artifact@v4
         with:
