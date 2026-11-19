@@ -19,26 +19,42 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-onnx.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+
           pip install numpy==1.26.4
-          pip install torch==2.5.1
+
+          pip install torch==2.5.1 \
+            --index-url https://download.pytorch.org/whl/cpu
+
           pip install onnx==1.17.0
           pip install onnxruntime==1.20.1
 
-      - name: Extract CompNet source
+      - name: Locate and verify CompNet files
+        shell: bash
         run: |
-          mkdir -p source
+          set -e
 
-          if ! find . -type f -iname "compnet.py" \
-            -not -path "./.git/*" | grep -q .; then
+          mkdir -p source output
 
-            ZIP_FILE=$(find . -type f -iname "compnet-main.zip" | head -1)
+          MODEL_FILE=$(find . -type f \
+            -iname "compnet.py" \
+            -not -path "./.git/*" | head -1)
+
+          if [ -z "$MODEL_FILE" ]; then
+
+            ZIP_FILE=$(find . -type f \
+              -iname "compnet-main.zip" \
+              -not -path "./.git/*" | head -1)
 
             if [ -z "$ZIP_FILE" ]; then
-              ZIP_FILE=$(find . -type f -iname "*.zip" | head -1)
+              ZIP_FILE=$(find . -type f \
+                -iname "*.zip" \
+                -not -path "./.git/*" | head -1)
             fi
 
             if [ -z "$ZIP_FILE" ]; then
@@ -46,10 +62,14 @@ jobs:
               exit 1
             fi
 
+            echo "Extracting: $ZIP_FILE"
+
             unzip -o "$ZIP_FILE" -d source
+
           fi
 
-          MODEL_FILE=$(find . -type f -iname "compnet.py" \
+          MODEL_FILE=$(find . -type f \
+            -iname "compnet.py" \
             -not -path "./.git/*" | head -1)
 
           WEIGHT_FILE=$(find . -type f \
@@ -62,23 +82,26 @@ jobs:
           fi
 
           if [ -z "$WEIGHT_FILE" ]; then
-            echo "ERROR: pretrained weights not found"
+            echo "ERROR: Tongji pretrained weights not found"
             exit 1
           fi
 
-          echo "MODEL_FILE=$MODEL_FILE" >> $GITHUB_ENV
-          echo "WEIGHT_FILE=$WEIGHT_FILE" >> $GITHUB_ENV
+          echo "MODEL_FILE=$MODEL_FILE" >> "$GITHUB_ENV"
+          echo "WEIGHT_FILE=$WEIGHT_FILE" >> "$GITHUB_ENV"
 
-          echo "CompNet source: $MODEL_FILE"
-          echo "Checkpoint: $WEIGHT_FILE"
+          echo "================================"
+          echo "COMPNET SOURCE: $MODEL_FILE"
+          echo "CHECKPOINT: $WEIGHT_FILE"
+          echo "================================"
 
       - name: Build and export ONNX
+        shell: bash
         run: |
-          mkdir -p output
 
           cat > export_compnet.py <<'PY'
           import os
           import importlib.util
+
           import torch
           import torch.nn as nn
           import numpy as np
@@ -88,13 +111,25 @@ jobs:
           MODEL_FILE = os.environ["MODEL_FILE"]
           WEIGHT_FILE = os.environ["WEIGHT_FILE"]
 
-          OUTPUT_FILE = "output/compnet_tongji_600_feature.onnx"
+          OUTPUT_FILE = (
+              "output/compnet_tongji_600_feature.onnx"
+          )
 
-          print("Loading CompNet source...")
+          print("================================")
+          print("COMPNet ONNX EXPORT")
+          print("================================")
+
+          print("PyTorch version:", torch.__version__)
+          print("NumPy version:", np.__version__)
+          print("ONNX version:", onnx.__version__)
+
+          print("\nLoading CompNet source...")
 
           spec = importlib.util.spec_from_file_location(
-              "compnet_module", MODEL_FILE
+              "compnet_module",
+              MODEL_FILE
           )
+
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
 
@@ -102,7 +137,7 @@ jobs:
 
           model = module.compnet(num_classes=600)
 
-          print("Loading pretrained weights...")
+          print("Loading pretrained checkpoint...")
 
           checkpoint = torch.load(
               WEIGHT_FILE,
@@ -110,12 +145,25 @@ jobs:
               weights_only=True
           )
 
-          model.load_state_dict(checkpoint, strict=True)
+          model.load_state_dict(
+              checkpoint,
+              strict=True
+          )
+
           model.eval()
 
           print("All pretrained weights loaded successfully.")
 
+          print("\nChecking model parameters...")
+
+          assert model.fc.weight.shape == (512, 9708)
+          assert model.arclayer.weight.shape == (600, 512)
+
+          print("FC:", tuple(model.fc.weight.shape))
+          print("ArcFace:", tuple(model.arclayer.weight.shape))
+
           class FeatureExtractor(nn.Module):
+
               def __init__(self, network):
                   super().__init__()
                   self.network = network
@@ -126,19 +174,38 @@ jobs:
           feature_model = FeatureExtractor(model)
           feature_model.eval()
 
-          # Expected input: grayscale 128x128
-          dummy_input = torch.randn(1, 1, 128, 128)
+          print("\nPreparing input...")
 
-          print("Testing PyTorch feature extraction...")
+          dummy_input = torch.randn(
+              1, 1, 128, 128,
+              dtype=torch.float32
+          )
+
+          print("Input shape:", tuple(dummy_input.shape))
+
+          print("\nTesting PyTorch...")
 
           with torch.no_grad():
               pytorch_output = feature_model(dummy_input)
 
-          print("PyTorch output shape:", tuple(pytorch_output.shape))
+          print(
+              "PyTorch output shape:",
+              tuple(pytorch_output.shape)
+          )
 
           assert pytorch_output.shape == (1, 512)
 
-          print("Exporting ONNX...")
+          assert torch.isfinite(pytorch_output).all()
+
+          pytorch_norm = torch.linalg.vector_norm(
+              pytorch_output,
+              ord=2,
+              dim=1
+          )
+
+          print("PyTorch feature norm:", pytorch_norm)
+
+          print("\nExporting ONNX...")
 
           torch.onnx.export(
               feature_model,
@@ -150,20 +217,29 @@ jobs:
               input_names=["input"],
               output_names=["feature"],
               dynamic_axes={
-                  "input": {0: "batch_size"},
-                  "feature": {0: "batch_size"}
+                  "input": {
+                      0: "batch_size"
+                  },
+                  "feature": {
+                      0: "batch_size"
+                  }
               },
               dynamo=False
           )
 
-          print("Checking ONNX model...")
+          print("ONNX export completed.")
+
+          print("\nChecking ONNX model...")
 
           onnx_model = onnx.load(OUTPUT_FILE)
-          onnx.checker.check_model(onnx_model)
 
-          print("ONNX model structure is valid.")
+          onnx.checker.check_model(
+              onnx_model
+          )
 
-          print("Testing ONNX Runtime...")
+          print("ONNX structure is valid.")
+
+          print("\nTesting ONNX Runtime...")
 
           session = ort.InferenceSession(
               OUTPUT_FILE,
@@ -172,33 +248,99 @@ jobs:
 
           onnx_output = session.run(
               ["feature"],
-              {"input": dummy_input.numpy()}
+              {
+                  "input": dummy_input.numpy()
+              }
           )[0]
 
-          difference = np.max(
-              np.abs(pytorch_output.numpy() - onnx_output)
+          print(
+              "ONNX output shape:",
+              onnx_output.shape
           )
 
-          print("ONNX output shape:", onnx_output.shape)
-          print("Maximum absolute difference:", difference)
-
           assert onnx_output.shape == (1, 512)
+
           assert np.isfinite(onnx_output).all()
 
-          norms = np.linalg.norm(onnx_output, axis=1)
-          print("Feature vector norm:", norms)
+          print("\nComparing PyTorch and ONNX...")
 
-          assert np.allclose(norms, 1.0, atol=1e-4)
-          assert difference < 1e-3
+          difference = np.max(
+              np.abs(
+                  pytorch_output.numpy() - onnx_output
+              )
+          )
 
-          print("SUCCESS: CompNet ONNX export verified.")
+          print(
+              "Maximum absolute difference:",
+              difference
+          )
 
-          print("ONNX file size:",
-                round(os.path.getsize(OUTPUT_FILE) / 1024 / 1024, 2),
-                "MB")
+          assert difference < 1e-3, (
+              "PyTorch and ONNX outputs differ too much"
+          )
+
+          norms = np.linalg.norm(
+              onnx_output,
+              axis=1
+          )
+
+          print("ONNX feature norm:", norms)
+
+          assert np.allclose(
+              norms,
+              1.0,
+              atol=1e-4
+          )
+
+          print("\n================================")
+          print("SUCCESS: ONNX VERIFIED")
+          print("================================")
+
+          file_size = (
+              os.path.getsize(OUTPUT_FILE)
+              / (1024 * 1024)
+          )
+
+          print(
+              "ONNX file size:",
+              round(file_size, 2),
+              "MB"
+          )
+
+          print(
+              "Output dimensions:",
+              onnx_output.shape
+          )
+
+          print(
+              "Input dimensions: 1 x 1 x 128 x 128"
+          )
+
+          print("Output dimensions: 1 x 512")
+
           PY
 
           python export_compnet.py
+
+      - name: Verify ONNX output file
+        shell: bash
+        run: |
+          set -e
+
+          FILE="output/compnet_tongji_600_feature.onnx"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: ONNX file was not created"
+            exit 1
+          fi
+
+          if [ ! -s "$FILE" ]; then
+            echo "ERROR: ONNX file is empty"
+            exit 1
+          fi
+
+          echo "ONNX file successfully created."
+          ls -lh "$FILE"
 
       - name: Upload ONNX Artifact
         uses: actions/upload-artifact@v4
