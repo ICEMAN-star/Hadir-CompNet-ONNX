@@ -1,0 +1,70 @@
+
+name: Inspect CompNet
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Extract CompNet source
+        run: |
+          unzip -q compnet-main.zip -d source
+          echo "=== PROJECT FILES ==="
+          find source/compnet-main/CompNet -maxdepth 2 -type f
+
+      - name: Install PyTorch CPU
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Inspect model source
+        run: |
+          echo "===== COMPNET.PY ====="
+          cat source/compnet-main/CompNet/models/compnet.py
+          echo "===== INFERENCE.PY ====="
+          cat source/compnet-main/CompNet/inference.py
+
+      - name: Inspect pretrained weights
+        run: |
+          python - <<'PY'
+          import torch
+
+          path = "net_params_tongji_600.pth"
+          print("Loading:", path)
+
+          obj = torch.load(
+              path,
+              map_location="cpu",
+              weights_only=True
+          )
+
+          print("Checkpoint type:", type(obj))
+
+          if isinstance(obj, dict):
+              print("Top-level keys:", list(obj.keys())[:30])
+
+              state = obj.get("state_dict", obj)
+              if isinstance(state, dict):
+                  print("\n=== PARAMETER SHAPES ===")
+                  for key, value in state.items():
+                      if hasattr(value, "shape"):
+                          print(key, tuple(value.shape))
+                      else:
+                          print(key, type(value))
+          else:
+              print("Object:", obj)
+          PY
