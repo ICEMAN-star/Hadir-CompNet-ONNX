@@ -1,0 +1,209 @@
+
+name: Build CompNet ONNX
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-onnx:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy==1.26.4
+          pip install torch==2.5.1
+          pip install onnx==1.17.0
+          pip install onnxruntime==1.20.1
+
+      - name: Extract CompNet source
+        run: |
+          mkdir -p source
+
+          if ! find . -type f -iname "compnet.py" \
+            -not -path "./.git/*" | grep -q .; then
+
+            ZIP_FILE=$(find . -type f -iname "compnet-main.zip" | head -1)
+
+            if [ -z "$ZIP_FILE" ]; then
+              ZIP_FILE=$(find . -type f -iname "*.zip" | head -1)
+            fi
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "ERROR: CompNet source ZIP not found"
+              exit 1
+            fi
+
+            unzip -o "$ZIP_FILE" -d source
+          fi
+
+          MODEL_FILE=$(find . -type f -iname "compnet.py" \
+            -not -path "./.git/*" | head -1)
+
+          WEIGHT_FILE=$(find . -type f \
+            -name "net_params_tongji_600.pth" \
+            -not -path "./.git/*" | head -1)
+
+          if [ -z "$MODEL_FILE" ]; then
+            echo "ERROR: compnet.py not found"
+            exit 1
+          fi
+
+          if [ -z "$WEIGHT_FILE" ]; then
+            echo "ERROR: pretrained weights not found"
+            exit 1
+          fi
+
+          echo "MODEL_FILE=$MODEL_FILE" >> $GITHUB_ENV
+          echo "WEIGHT_FILE=$WEIGHT_FILE" >> $GITHUB_ENV
+
+          echo "CompNet source: $MODEL_FILE"
+          echo "Checkpoint: $WEIGHT_FILE"
+
+      - name: Build and export ONNX
+        run: |
+          mkdir -p output
+
+          cat > export_compnet.py <<'PY'
+          import os
+          import importlib.util
+          import torch
+          import torch.nn as nn
+          import numpy as np
+          import onnx
+          import onnxruntime as ort
+
+          MODEL_FILE = os.environ["MODEL_FILE"]
+          WEIGHT_FILE = os.environ["WEIGHT_FILE"]
+
+          OUTPUT_FILE = "output/compnet_tongji_600_feature.onnx"
+
+          print("Loading CompNet source...")
+
+          spec = importlib.util.spec_from_file_location(
+              "compnet_module", MODEL_FILE
+          )
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+
+          print("Creating CompNet model...")
+
+          model = module.compnet(num_classes=600)
+
+          print("Loading pretrained weights...")
+
+          checkpoint = torch.load(
+              WEIGHT_FILE,
+              map_location="cpu",
+              weights_only=True
+          )
+
+          model.load_state_dict(checkpoint, strict=True)
+          model.eval()
+
+          print("All pretrained weights loaded successfully.")
+
+          class FeatureExtractor(nn.Module):
+              def __init__(self, network):
+                  super().__init__()
+                  self.network = network
+
+              def forward(self, image):
+                  return self.network.getFeatureCode(image)
+
+          feature_model = FeatureExtractor(model)
+          feature_model.eval()
+
+          # Expected input: grayscale 128x128
+          dummy_input = torch.randn(1, 1, 128, 128)
+
+          print("Testing PyTorch feature extraction...")
+
+          with torch.no_grad():
+              pytorch_output = feature_model(dummy_input)
+
+          print("PyTorch output shape:", tuple(pytorch_output.shape))
+
+          assert pytorch_output.shape == (1, 512)
+
+          print("Exporting ONNX...")
+
+          torch.onnx.export(
+              feature_model,
+              dummy_input,
+              OUTPUT_FILE,
+              export_params=True,
+              opset_version=17,
+              do_constant_folding=True,
+              input_names=["input"],
+              output_names=["feature"],
+              dynamic_axes={
+                  "input": {0: "batch_size"},
+                  "feature": {0: "batch_size"}
+              },
+              dynamo=False
+          )
+
+          print("Checking ONNX model...")
+
+          onnx_model = onnx.load(OUTPUT_FILE)
+          onnx.checker.check_model(onnx_model)
+
+          print("ONNX model structure is valid.")
+
+          print("Testing ONNX Runtime...")
+
+          session = ort.InferenceSession(
+              OUTPUT_FILE,
+              providers=["CPUExecutionProvider"]
+          )
+
+          onnx_output = session.run(
+              ["feature"],
+              {"input": dummy_input.numpy()}
+          )[0]
+
+          difference = np.max(
+              np.abs(pytorch_output.numpy() - onnx_output)
+          )
+
+          print("ONNX output shape:", onnx_output.shape)
+          print("Maximum absolute difference:", difference)
+
+          assert onnx_output.shape == (1, 512)
+          assert np.isfinite(onnx_output).all()
+
+          norms = np.linalg.norm(onnx_output, axis=1)
+          print("Feature vector norm:", norms)
+
+          assert np.allclose(norms, 1.0, atol=1e-4)
+          assert difference < 1e-3
+
+          print("SUCCESS: CompNet ONNX export verified.")
+
+          print("ONNX file size:",
+                round(os.path.getsize(OUTPUT_FILE) / 1024 / 1024, 2),
+                "MB")
+          PY
+
+          python export_compnet.py
+
+      - name: Upload ONNX Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CompNet-ONNX-Tongji-600
+          path: output/compnet_tongji_600_feature.onnx
+          if-no-files-found: error
+          retention-days: 30
