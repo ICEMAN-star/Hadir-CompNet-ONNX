@@ -15,7 +15,7 @@ jobs:
     steps:
 
       # ==========================================
-      # 1. Prepare Python
+      # 1. Set up Python
       # ==========================================
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,7 +23,7 @@ jobs:
           python-version: "3.10"
 
       # ==========================================
-      # 2. Install ONNX libraries
+      # 2. Install dependencies
       # ==========================================
       - name: Install dependencies
         shell: bash
@@ -37,7 +37,7 @@ jobs:
           pip install onnxruntime==1.20.1
 
       # ==========================================
-      # 3. Find latest successful build
+      # 3. Find latest successful CompNet build
       # ==========================================
       - name: Find latest CompNet build
         shell: bash
@@ -67,38 +67,7 @@ jobs:
           echo "BUILD_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
 
       # ==========================================
-      # 4. Locate uploaded Artifact
-      # ==========================================
-      - name: Locate CompNet ONNX Artifact
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-
-          echo "Searching for ONNX artifact..."
-
-          ARTIFACT_ID=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts" \
-            --jq '.artifacts[]
-              | select(
-                  .name == "CompNet-ONNX-Tongji-600"
-                  and .expired == false
-                )
-              | .id' | head -n 1)
-
-          if [ -z "$ARTIFACT_ID" ]; then
-            echo "ERROR: CompNet ONNX Artifact not found."
-            echo "It may have expired or the artifact name may differ."
-            exit 1
-          fi
-
-          echo "Artifact ID: $ARTIFACT_ID"
-
-          echo "ARTIFACT_ID=$ARTIFACT_ID" >> "$GITHUB_ENV"
-
-      # ==========================================
-      # 5. Download Artifact from GitHub
+      # 4. Download ONNX Artifact
       # ==========================================
       - name: Download ONNX Artifact
         shell: bash
@@ -107,22 +76,17 @@ jobs:
         run: |
           set -e
 
-          echo "Downloading ONNX artifact..."
-
-          gh api \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
-            --output compnet_artifact.zip
-
-          if [ ! -s compnet_artifact.zip ]; then
-            echo "ERROR: Downloaded artifact is empty."
-            exit 1
-          fi
+          echo "Downloading CompNet ONNX artifact..."
 
           mkdir -p downloaded
 
-          unzip -o compnet_artifact.zip -d downloaded
+          gh run download "$BUILD_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "CompNet-ONNX-Tongji-600" \
+            --dir downloaded
 
           echo "Downloaded files:"
+
           find downloaded -type f
 
           MODEL_FILE=$(find downloaded \
@@ -130,7 +94,7 @@ jobs:
             -iname "*.onnx" | head -n 1)
 
           if [ -z "$MODEL_FILE" ]; then
-            echo "ERROR: ONNX model not found in artifact."
+            echo "ERROR: ONNX model not found."
             exit 1
           fi
 
@@ -139,7 +103,26 @@ jobs:
           echo "Found model: $MODEL_FILE"
 
       # ==========================================
-      # 6. Inspect ONNX model
+      # 5. Verify downloaded model
+      # ==========================================
+      - name: Verify downloaded ONNX
+        shell: bash
+        run: |
+          set -e
+
+          echo "Verifying ONNX file..."
+
+          if [ ! -s "$MODEL_FILE" ]; then
+            echo "ERROR: ONNX file missing or empty."
+            exit 1
+          fi
+
+          ls -lh "$MODEL_FILE"
+
+          echo "PASS: ONNX file downloaded successfully."
+
+      # ==========================================
+      # 6. Inspect ONNX structure and inference
       # ==========================================
       - name: Inspect ONNX structure
         shell: bash
@@ -147,7 +130,6 @@ jobs:
 
           cat > inspect_compnet.py <<'PY'
           import os
-          import sys
           import numpy as np
           import onnx
           import onnxruntime as ort
@@ -158,10 +140,15 @@ jobs:
           print("COMPNET ONNX MODEL INSPECTION")
           print("====================================")
 
-          print("\nModel file:", model_path)
+          # ----------------------------------
+          # File information
+          # ----------------------------------
+
+          print("\n[1] Model file information")
 
           file_size = os.path.getsize(model_path)
 
+          print("Model path:", model_path)
           print(
               "File size:",
               round(file_size / (1024 * 1024), 2),
@@ -172,94 +159,89 @@ jobs:
           # Load ONNX
           # ----------------------------------
 
-          print("\n[1] Loading ONNX model...")
+          print("\n[2] Loading ONNX model")
 
           model = onnx.load(model_path)
 
-          print("ONNX IR version:", model.ir_version)
-          print(
-              "Producer:",
-              model.producer_name,
-              model.producer_version
-          )
+          print("IR version:", model.ir_version)
+          print("Producer:", model.producer_name)
+          print("Producer version:", model.producer_version)
 
           # ----------------------------------
-          # Validate graph
+          # Validate ONNX
           # ----------------------------------
 
-          print("\n[2] Validating ONNX graph...")
+          print("\n[3] Checking ONNX graph")
 
           onnx.checker.check_model(model)
 
           print("PASS: ONNX graph is valid.")
 
           # ----------------------------------
-          # Inspect operators
+          # Operators
           # ----------------------------------
 
-          print("\n[3] Model operators...")
+          print("\n[4] Model operators")
 
           operators = sorted(
               set(node.op_type for node in model.graph.node)
           )
 
-          print("Total graph nodes:", len(model.graph.node))
+          print("Total nodes:", len(model.graph.node))
           print("Unique operators:", len(operators))
 
           for op in operators:
-              print(" -", op)
+              print("Operator:", op)
 
           # ----------------------------------
-          # Inspect graph inputs
+          # Tensor shape helper
           # ----------------------------------
 
-          print("\n[4] Model inputs...")
+          def get_shape(value_info):
+              tensor = value_info.type.tensor_type
+              shape = []
+
+              for dim in tensor.shape.dim:
+                  if dim.dim_value:
+                      shape.append(dim.dim_value)
+                  elif dim.dim_param:
+                      shape.append(dim.dim_param)
+                  else:
+                      shape.append("dynamic")
+
+              return shape
+
+          # ----------------------------------
+          # Inputs
+          # ----------------------------------
+
+          print("\n[5] Model inputs")
 
           for item in model.graph.input:
               tensor = item.type.tensor_type
 
-              shape = []
-
-              for dim in tensor.shape.dim:
-                  if dim.dim_value:
-                      shape.append(dim.dim_value)
-                  elif dim.dim_param:
-                      shape.append(dim.dim_param)
-                  else:
-                      shape.append("dynamic")
-
               print("Input name:", item.name)
-              print("Input shape:", shape)
+              print("Input shape:", get_shape(item))
               print("Input element type:", tensor.elem_type)
 
           # ----------------------------------
-          # Inspect graph outputs
+          # Outputs
           # ----------------------------------
 
-          print("\n[5] Model outputs...")
+          print("\n[6] Model outputs")
 
           for item in model.graph.output:
               tensor = item.type.tensor_type
 
-              shape = []
-
-              for dim in tensor.shape.dim:
-                  if dim.dim_value:
-                      shape.append(dim.dim_value)
-                  elif dim.dim_param:
-                      shape.append(dim.dim_param)
-                  else:
-                      shape.append("dynamic")
-
               print("Output name:", item.name)
-              print("Output shape:", shape)
+              print("Output shape:", get_shape(item))
               print("Output element type:", tensor.elem_type)
 
           # ----------------------------------
-          # ONNX Runtime
+          # Create ONNX Runtime session
           # ----------------------------------
 
-          print("\n[6] Creating ONNX Runtime session...")
+          print("\n[7] ONNX Runtime session")
 
           session = ort.InferenceSession(
               model_path,
@@ -268,33 +250,32 @@ jobs:
 
           print("PASS: ONNX Runtime loaded the model.")
 
+          input_meta = session.get_inputs()
+          output_meta = session.get_outputs()
+
           print("\nRuntime inputs:")
 
-          input_meta = session.get_inputs()
-
           for item in input_meta:
-              print(
-                  item.name,
-                  item.shape,
-                  item.type
-              )
+              print(item.name, item.shape, item.type)
 
           print("\nRuntime outputs:")
 
-          output_meta = session.get_outputs()
-
           for item in output_meta:
-              print(
-                  item.name,
-                  item.shape,
-                  item.type
+              print(item.name, item.shape, item.type)
+
+          # ----------------------------------
+          # Validate input count and type
+          # ----------------------------------
+
+          print("\n[8] Preparing test input")
+
+          if len(input_meta) != 1:
+              raise RuntimeError(
+                  "Expected one input, found "
+                  + str(len(input_meta))
               )
 
-          # ----------------------------------
-          # Prepare compatible dummy input
-          # ----------------------------------
-
-          print("\n[7] Preparing test input...")
+          input_info = input_meta[0]
 
           dtype_map = {
               "tensor(float)": np.float32,
@@ -308,21 +289,11 @@ jobs:
               "tensor(bool)": np.bool_
           }
 
-          if len(input_meta) != 1:
-              raise RuntimeError(
-                  "Expected one input, found "
-                  + str(len(input_meta))
-              )
-
-          input_info = input_meta[0]
-
           if input_info.type not in dtype_map:
               raise RuntimeError(
                   "Unsupported input type: "
                   + input_info.type
               )
-
-          input_dtype = dtype_map[input_info.type]
 
           input_shape = []
 
@@ -332,8 +303,7 @@ jobs:
               else:
                   input_shape.append(1)
 
-          print("Test input shape:", input_shape)
-          print("Test input dtype:", input_dtype)
+          input_dtype = dtype_map[input_info.type]
 
           rng = np.random.default_rng(42)
 
@@ -354,11 +324,14 @@ jobs:
                   dtype=input_dtype
               )
 
+          print("Input shape:", dummy_input.shape)
+          print("Input dtype:", dummy_input.dtype)
+
           # ----------------------------------
           # Run inference
           # ----------------------------------
 
-          print("\n[8] Running inference...")
+          print("\n[9] Running inference")
 
           results = session.run(
               None,
@@ -370,84 +343,106 @@ jobs:
           print("PASS: Inference completed.")
 
           # ----------------------------------
-          # Inspect output
+          # Validate output
           # ----------------------------------
 
-          print("\n[9] Output verification...")
+          print("\n[10] Output verification")
 
-          for index, output in enumerate(results):
-
-              print(
-                  "\nOutput",
-                  index,
-                  "shape:",
-                  output.shape
+          if len(results) != 1:
+              raise RuntimeError(
+                  "Expected one output, found "
+                  + str(len(results))
               )
 
-              print(
-                  "Output dtype:",
-                  output.dtype
+          output = results[0]
+
+          print("Output shape:", output.shape)
+          print("Output dtype:", output.dtype)
+
+          if not np.issubdtype(
+              output.dtype,
+              np.floating
+          ):
+              raise RuntimeError(
+                  "Output is not floating point."
               )
 
-              if not np.isfinite(output).all():
-                  raise RuntimeError(
-                      "Output contains NaN or infinity."
-                  )
+          if not np.isfinite(output).all():
+              raise RuntimeError(
+                  "Output contains NaN or infinity."
+              )
 
-              print("PASS: Output contains finite values.")
+          print("PASS: Output values are finite.")
 
-              if output.ndim >= 1 and output.shape[-1] == 512:
-                  print(
-                      "PASS: Output has 512-dimensional features."
-                  )
+          # ----------------------------------
+          # Validate feature dimensions
+          # ----------------------------------
 
-                  if np.issubdtype(
-                      output.dtype,
-                      np.floating
-                  ):
-                      norms = np.linalg.norm(
-                          output.reshape(-1, 512),
-                          axis=1
-                      )
+          print("\n[11] Feature dimensions")
 
-                      print("Feature norms:", norms)
+          if output.ndim != 2:
+              raise RuntimeError(
+                  "Expected 2D feature output."
+              )
 
-                      if np.allclose(
-                          norms,
-                          1.0,
-                          atol=1e-3
-                      ):
-                          print("PASS: Features are L2 normalized.")
-                      else:
-                          print(
-                              "WARNING: Features are not unit normalized."
-                          )
+          if output.shape[1] != 512:
+              raise RuntimeError(
+                  "Expected 512-dimensional features, got "
+                  + str(output.shape)
+              )
+
+          print("PASS: Feature dimensions = 512.")
+
+          # ----------------------------------
+          # Check normalization
+          # ----------------------------------
+
+          print("\n[12] Feature normalization")
+
+          norms = np.linalg.norm(
+              output,
+              axis=1
+          )
+
+          print("Feature norms:", norms)
+
+          if not np.allclose(
+              norms,
+              1.0,
+              atol=1e-3
+          ):
+              raise RuntimeError(
+                  "Feature vectors are not L2 normalized."
+              )
+
+          print("PASS: Features are L2 normalized.")
 
           # ----------------------------------
           # Final report
           # ----------------------------------
 
           print("\n====================================")
-          print("COMPNET ONNX INSPECTION COMPLETED")
+          print("COMPNET ONNX INSPECTION SUCCESS")
           print("====================================")
 
           print("ONNX graph: VALID")
           print("ONNX Runtime: WORKING")
           print("Inference: SUCCESSFUL")
+          print("Feature dimensions: 512")
+          print("Normalization: VERIFIED")
 
           PY
 
           python inspect_compnet.py
 
       # ==========================================
-      # 7. Save inspection report
+      # 7. Upload inspection report
       # ==========================================
-      - name: Save inspection report
+      - name: Upload inspection report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: CompNet-ONNX-Inspection-Report
-          path: |
-            inspect_compnet.py
+          path: inspect_compnet.py
           if-no-files-found: warn
           retention-days: 30
